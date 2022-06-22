@@ -1,4 +1,4 @@
-package at.allianz.mergebot;
+package org.opin.mergebot;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -11,8 +11,11 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.List;
+import java.util.Collection;
 import java.util.stream.Collectors;
 
 import javax.json.Json;
@@ -37,6 +40,9 @@ import org.kohsuke.github.GHPullRequest.MergeMethod;
 import org.kohsuke.github.GHRef;
 import org.kohsuke.github.GHRepository;
 import org.kohsuke.github.GitHub;
+import org.kohsuke.github.GHUser;
+import org.kohsuke.github.GHTeam;
+import org.kohsuke.github.GHLabel;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -53,9 +59,13 @@ public class IssuePullRequest extends Event {
 	public void process(HttpServletRequest incoming, HttpServletResponse outgoing, String eventType) {
 		Map<String, String> mergeTriggerMap = new HashMap<>();
 		StringBuilder builder = new StringBuilder();
+		String aux = null;
 		String text = null;
 		try(BufferedReader readerIncoming = incoming.getReader();){
-			text = readPayload(builder, readerIncoming);
+			while ((aux = readerIncoming.readLine()) != null) {
+				builder.append(aux);
+			}
+			text = builder.toString();
 			mergeTriggerMap = generateMergeTriggerMap();
 		} catch (IOException e){
 			logger.info("No MergeTrigger rules are defined or payload can not be read.", e);
@@ -80,8 +90,13 @@ public class IssuePullRequest extends Event {
 				String mergeToBranch = existingPullRequest.getBase().getRef();
 				String mergeFromBranch = existingPullRequest.getHead().getRef();
 
-				usingMbBranchRunStatusChecksIfNot(mergeTriggerMap, github, existingPullRequest, ghRepo, mergeToBranch,
-						mergeFromBranch);
+				if (developerIsUsingMergeBotBranch(mergeFromBranch, existingPullRequest, github)) {
+					developerIsUsingMergeBotBranchClosePR(mergeToBranch, existingPullRequest, ghRepo);
+				} else {
+					GHPullRequest initialPullRequest = ghRepo
+							.getPullRequest(getNumberInitialPullRequest(existingPullRequest));
+					runStatusChecks(mergeTriggerMap, ghRepo, existingPullRequest, mergeToBranch, initialPullRequest);
+				}
 
 			}
 			if (prClosed(existingpr, existingPullRequest)) {
@@ -91,7 +106,8 @@ public class IssuePullRequest extends Event {
 				GHPullRequest initialPullRequest = ghRepo
 						.getPullRequest(getNumberInitialPullRequest(existingPullRequest));
 
-				String mergeFromBranch = existingPullRequest.getBase().getRef();
+				String mergeFromBranch;
+				mergeFromBranch = existingPullRequest.getBase().getRef();
 				String mergeToBranch = mergeTriggerMap.get(mergeFromBranch);
 
 				deleteOldTmpMergeBotBranch(ghRepo, existingPullRequest);
@@ -99,9 +115,17 @@ public class IssuePullRequest extends Event {
 						"Merge from Branch {}___Merge to Branch {}___PR Number {}___PR ID {}",
 						mergeFromBranch, mergeToBranch, existingPullRequest.getNumber(),existingPullRequest.getId());
 				// if default branch (main) is reached no more action is taken -- finished!
+				// if default branch (main) is reached no more action is taken -- finished!
 				if (!mergeFromBranch.equals(ghRepo.getDefaultBranch()) && mergeToBranch != null) {
 
-					readLabelandexecuteAction(existingPullRequest, ghRepo, initialPullRequest, mergeToBranch);
+					if (containsLabel(existingPullRequest, NO_PORTING)) {
+						logger.info("NO_PORTING MERGE");
+					}
+					if (containsLabel(existingPullRequest, MANUAL)
+							|| !containsLabel(existingPullRequest, labelNameList)) {
+						logger.info("NORMAL/MANUAL MERGE");
+						doCherryPickAndCreateNewPr(ghRepo, existingPullRequest, initialPullRequest, mergeToBranch);
+					}
 				}
 					executePostCommitGroovyScript(initialPullRequest, existingPullRequest);
 			}
@@ -112,40 +136,6 @@ public class IssuePullRequest extends Event {
 		} catch (Exception e) {
 			logger.error("Exception", e);
 		} 
-	}
-
-	private void readLabelandexecuteAction(GHPullRequest existingPullRequest, GHRepository ghRepo,
-			GHPullRequest initialPullRequest, String mergeToBranch) {
-		if (containsLabel(existingPullRequest, NO_PORTING)) {
-			logger.info("NO_PORTING MERGE");
-		}
-		if (containsLabel(existingPullRequest, MANUAL)
-				|| !containsLabel(existingPullRequest, labelNameList)) {
-			logger.info("NORMAL/MANUAL MERGE");
-			doCherryPickAndCreateNewPr(ghRepo, existingPullRequest, initialPullRequest, mergeToBranch);
-		}
-	}
-
-	private String readPayload(StringBuilder builder, BufferedReader readerIncoming) throws IOException {
-		String aux;
-		String text;
-		while ((aux = readerIncoming.readLine()) != null) {
-			builder.append(aux);
-		}
-		text = builder.toString();
-		return text;
-	}
-
-	private void usingMbBranchRunStatusChecksIfNot(Map<String, String> mergeTriggerMap, GitHub github,
-			GHPullRequest existingPullRequest, GHRepository ghRepo, String mergeToBranch, String mergeFromBranch)
-			throws IOException {
-		if (developerIsUsingMergeBotBranch(mergeFromBranch, existingPullRequest, github)) {
-			developerIsUsingMergeBotBranchClosePR(mergeToBranch, existingPullRequest, ghRepo);
-		} else {
-			GHPullRequest initialPullRequest = ghRepo
-					.getPullRequest(getNumberInitialPullRequest(existingPullRequest));
-			runStatusChecks(mergeTriggerMap, ghRepo, existingPullRequest, mergeToBranch, initialPullRequest);
-		}
 	}
 
 	private GitHub connectToEnterpriseWithOAuth() throws IOException {
@@ -241,6 +231,21 @@ public class IssuePullRequest extends Event {
 				tmpFromBranch = ghRepo.getBranch(urlEncodedTmpBranchNameMergeBot);
 				GHPullRequest newPr = createNewPullRequestAndRelateWithParent(ghRepo, existingPullRequest,
 						initialPullRequest, mergeToBranch, tmpFromBranch, squashedCommitForCherryPick.getSHA1());
+					
+				// Keep Assignees 
+				List<GHUser> varAssignees = initialPullRequest.getAssignees();
+				if(varAssignees!=null && varAssignees.size()>0) newPr.setAssignees(varAssignees);
+					
+				// Keep Reviewers
+				List<GHUser> varReviewer = initialPullRequest.getRequestedReviewers();
+				if(varReviewer!=null && varReviewer.size()>0) newPr.requestReviewers(varReviewer);
+				List<GHTeam> varTeamReviewers = initialPullRequest.getRequestedTeams();
+				if(varTeamReviewers!=null && varTeamReviewers.size()>0) newPr.requestTeamReviewers(varTeamReviewers);
+
+				// Keep Labels
+				Collection<GHLabel> varLabels = initialPullRequest.getLabels();
+				if(varLabels!=null && varLabels.size()>0) newPr.addLabels(varLabels);
+
 				// Merge newly created Pull Request because no Label is set to it / no new Pull
 				// Request if label "Manual" is set
 				if (!containsLabel(existingPullRequest, labelNameList)) {
@@ -352,15 +357,25 @@ public class IssuePullRequest extends Event {
 		HttpPost request;
 		StringEntity entity;
 		HttpClient httpClient;
-			httpClient = HttpClientBuilder.create().build();
+			httpClient = HttpClientBuilder.create().useSystemProperties().build();
 
 			String json = Json.createObjectBuilder().add("base", tmpBranchNameMergeBot)
 					.add("head", squashedCommit.getSHA1()).build().toString();
+			//Tobias: Remove Auth from URL
+			//request = new HttpPost(
+			//		API_URL + "/repos/" + ghRepo.getFullName() + "/merges?client_id=" + USER + "&access_token=" + TOKEN);
 			request = new HttpPost(
-					API_URL + "/repos/" + ghRepo.getFullName() + "/merges?client_id=" + USER + "&access_token=" + TOKEN);
+					API_URL + "/repos/" + ghRepo.getFullName() + "/merges");
 			entity = new StringEntity(json);
 			request.addHeader("Accept", "application/json");
+			
+			//Tobias: Add Auth to Header
+			String authPlain=USER+":"+TOKEN;
+			String auth = Base64.getEncoder().encodeToString(authPlain.getBytes());
+			request.addHeader("Authorization", "Basic "+auth);
+			
 			request.setEntity(entity);
+
 			return httpClient.execute(request);
 	}
 
